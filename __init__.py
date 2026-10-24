@@ -75,7 +75,7 @@ FACT_STORE_SCHEMA = {
                                         "find the fact; never shown as part of it. 'update' replaces the fact's "
                                         "keywords."},
             "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
-            "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
+            "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general", "wiki", "realm-forge"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
