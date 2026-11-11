@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.6.2 — 2026-11-11
+
+### Changed
+
+- **A superseded fact is retired, not deleted.** `add` with `supersedes` used to delete the old row, so a correction
+  left no trace: nothing said what the store used to assert, when it changed, or that a change had happened at all
+  (and a bad correction could not be undone). The old row now stays on disk with `retired_at`/`retired_by`, points at
+  its replacement through a `fact_links` edge (`relation='supersedes'`) and drops out of every read path: search,
+  probe, reason, related, contradict, list, export, review and the date probes. `remove` still deletes for real.
+  A correction inherits the old fact's category unless one is named; superseding an already-retired fact targets the
+  current head of the chain; re-asserting a retired wording reactivates that row instead of leaving a dangling
+  replacement.
+
+### Added
+
+- **`history {fact_id}`** — the supersession chain a fact belongs to, oldest first, from either end: text, when it was
+  stored and retired, and which fact replaced it.
+- **Event dates.** A fact now carries the date it is *about* (`event_date`), taken from the leftmost explicit date in
+  its text or from an explicit `event_date` argument, separate from when it was written. One guarded backfill covers
+  rows that predate the column (536 of 732 live facts carry one). `search` takes `since`/`before` bounds over it,
+  falling back to the write date for undated facts. Relative words ("yesterday") are never resolved.
+
+### Fixed
+
+- `stats` counts active facts only, and reports `retired_facts` separately.
+
 ## 0.6.1 — 2026-10-11
 
 ### Fixed

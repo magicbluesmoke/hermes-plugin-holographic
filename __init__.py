@@ -21,6 +21,7 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from utils import is_truthy_value
 from . import holographic as hrr
+from . import intent as _intent
 from .store import DuplicateContentError, MemoryStore
 from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
@@ -47,8 +48,8 @@ FACT_STORE_SCHEMA = {
         "• probe {entity} — every fact about a person or thing.\n"
         "• reason {entities} — facts that involve ALL of them.\n"
         "• add {content, entities?, keywords?, supersedes?} — one short standalone sentence. The result lists similar "
-        "facts and possible conflicts: if the new fact replaces one, add it with supersedes=<old id>.\n"
-        "• update / remove {fact_id} · list · stats · export · review (clean-up candidates) · related · contradict.\n"
+        "facts and possible conflicts: if the new fact replaces one, add it with supersedes=<old id> (the old fact is kept as retired history and drops out of recall).\n"
+        "• update / remove {fact_id} · list · stats · export · review (clean-up candidates) · related · contradict · history {fact_id} (a superseded fact's chain: what replaced it and when).\n"
         "• enrich — facts stored without keywords: give each some with update {fact_id, keywords}.\n"
         "• entities — known names and aliases · alias {entity, content=<other name>} — one entity, two names "
         "(merges them if both exist).\n"
@@ -59,14 +60,14 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["add", "search", "probe", "related", "reason", "contradict", "update",
                                                   "remove", "list", "stats", "export", "review", "entities", "alias",
-                                                  "enrich"]},
+                                                  "enrich", "history"]},
             "content": {"type": "string", "description": "Fact text for 'add' / 'update': one short standalone sentence."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
             "entities": {"type": "array", "items": {"type": "string"},
                          "description": "'reason': the entities to join. 'add'/'update': who or what the fact is about; "
                                         "needed for one-word names (e.g. a first name), so later facts link to them."},
-            "supersedes": {"type": "integer", "description": "'add': id of the fact this one replaces (removed in the same step)."},
+            "supersedes": {"type": "integer", "description": "'add': id of the fact this one replaces (the old fact is retired, not deleted: kept for history, out of recall, linked to the new one)."},
             "keywords": {"type": "array", "items": {"type": "string"},
                          "description": "'add'/'update': 3-8 words or short phrases someone might use to ask for this fact "
                                         "that are NOT in its text: synonyms, words of another root, broader terms, and "
@@ -74,7 +75,12 @@ FACT_STORE_SCHEMA = {
                                         "May 3' -> birth date, anniversary, день рождения, cumpleaños). Used only to "
                                         "find the fact; never shown as part of it. 'update' replaces the fact's "
                                         "keywords."},
-            "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
+            "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'/'history'."},
+            "event_date": {"type": "string", "description": "'add': YYYY-MM-DD the fact itself is about, when the text "
+                                                          "does not state it. Inferred from the text otherwise."},
+            "since": {"type": "string", "description": "'search': only facts dated YYYY-MM-DD or later (a fact's own "
+                                                       "date, else the day it was written)."},
+            "before": {"type": "string", "description": "'search': only facts dated before YYYY-MM-DD."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general", "wiki", "realm-forge"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
@@ -467,7 +473,10 @@ class HolographicMemoryProvider(MemoryProvider):
         try:
             key = f"{session_id or self._session_id or ''}|{self._scope_key or ''}"
             turn = self._turns[key] = self._turns.get(key, 0) + 1
-            candidates = self._retriever.search(query, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES)
+            _cat, _mt, _lim, _intent_label = _intent.scope_search(
+                query, category=None, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES
+            )
+            candidates = self._retriever.search(query, category=_cat, min_trust=_mt, limit=_lim)
             # Recently injected facts are dropped BEFORE the top five are taken, so they leave room for others.
             fresh = [f for f in self._retriever.relevant(query, candidates, self._min_coverage)
                      if self._not_recent(key, f, turn)][:_PREFETCH_FACTS]
@@ -680,6 +689,23 @@ class HolographicMemoryProvider(MemoryProvider):
     def _trust_floor(self, a: dict) -> float:
         return float(a.get("min_trust", self._min_trust))
 
+    def _scoped_search(self, a: dict) -> list:
+        """Run fact_store search with intent-based scoping when category/min_trust
+        are not explicitly provided by the caller."""
+        query = a["query"]
+        explicit_cat = a.get("category")
+        explicit_mt = a.get("min_trust", None)
+        # If min_trust was explicitly passed, preserve it; otherwise let intent fill.
+        mt = explicit_mt if explicit_mt is not None else None
+        _cat, _mt, _lim, _intent_label = _intent.scope_search(
+            query, category=explicit_cat, min_trust=mt, limit=_limit(a)
+        )
+        # If caller explicitly set min_trust, use that (scope_search preserves it).
+        if explicit_mt is not None:
+            _mt = float(explicit_mt)
+        return self._retriever.search(query, category=_cat, min_trust=_mt, limit=_lim,
+                                      since=a.get("since"), before=a.get("before"))
+
     @staticmethod
     def _entities(a: dict) -> list[str]:
         value = a.get("entities") or []
@@ -700,14 +726,18 @@ class HolographicMemoryProvider(MemoryProvider):
         if a.get("supersedes") is not None:
             old_id = int(a["supersedes"])
             try:
-                fact_id, created = self._store.replace_fact(old_id, a["content"], category=category, tags=tags, entities=entities)
+                fact_id, created = self._store.replace_fact(old_id, a["content"], category=a.get("category"),
+                                                            tags=tags, entities=entities)
             except KeyError:
                 return tool_error(f"Not stored: fact #{old_id} (supersedes) does not exist; nothing was changed.")
             result = {"fact_id": fact_id, "status": "added" if created else "exists"}
             if fact_id != old_id:
                 result["superseded"] = old_id
+                result["note"] = (f"fact #{old_id} is retired, not deleted: kept out of recall and linked to "
+                                  f"#{fact_id}. history {{fact_id: {fact_id}}} shows the chain.")
             return json.dumps(result)
-        fact_id, created = self._store.add_fact_status(a["content"], category=category, tags=tags, entities=entities)
+        fact_id, created = self._store.add_fact_status(a["content"], category=category, tags=tags, entities=entities,
+                                                       event_date=a.get("event_date"))
         result: dict = {"fact_id": fact_id, "status": "added" if created else "exists"}
         if created:
             check = self._retriever.write_check(fact_id)
@@ -749,18 +779,31 @@ class HolographicMemoryProvider(MemoryProvider):
             return tool_error("action must be 'helpful' or 'unhelpful'")
         return json.dumps(self._store.record_feedback(int(a["fact_id"]), helpful=a["action"] == "helpful"))
 
+    def _history(self, a: dict) -> str:
+        """A fact's supersession chain: what it said over time and which fact replaced it (oldest first)."""
+        try:
+            fact_id = int(a["fact_id"])
+        except (KeyError, TypeError, ValueError):
+            return tool_error("history requires 'fact_id'")
+        chain = self._store.fact_history(fact_id)
+        if not chain:
+            return tool_error(f"No fact #{fact_id}.")
+        return json.dumps({"fact_id": fact_id, "chain": chain})
+
     def _stats(self, a: dict) -> str:
         """What is in the store and whether recall works: counts, categories, how many facts were ever recalled."""
         self._flush_counts(self._scope_key)
         read = self._store.read
-        by_category = {r[0] or "general": r[1] for r in read("SELECT category, COUNT(*) FROM facts GROUP BY category")}
+        by_category = {r[0] or "general": r[1] for r in
+                       read("SELECT category, COUNT(*) FROM facts WHERE retired_at IS NULL GROUP BY category")}
         return json.dumps({
-            "facts": self._store.count_facts(), "entities": read("SELECT COUNT(*) FROM entities")[0][0],
+            "facts": self._store.count_facts(), "retired_facts": self._store.count_retired(),
+            "entities": read("SELECT COUNT(*) FROM entities")[0][0],
             "by_category": by_category,
-            "recalled_at_least_once": read("SELECT COUNT(*) FROM facts WHERE retrieval_count > 0")[0][0],
-            "without_keywords": read("SELECT COUNT(*) FROM facts WHERE COALESCE(tags, '') NOT LIKE ? AND COALESCE(tags, '') "
-                                     "NOT LIKE ?", (_KW_MARK + "%", "%\n" + _KW_MARK + "%"))[0][0],
-            "low_trust": read("SELECT COUNT(*) FROM facts WHERE trust_score < ?", (self._min_trust,))[0][0],
+            "recalled_at_least_once": read("SELECT COUNT(*) FROM facts WHERE retired_at IS NULL AND retrieval_count > 0")[0][0],
+            "without_keywords": read("SELECT COUNT(*) FROM facts WHERE retired_at IS NULL AND COALESCE(tags, '') "
+                                     "NOT LIKE ? AND COALESCE(tags, '') NOT LIKE ?", (_KW_MARK + "%", "%\n" + _KW_MARK + "%"))[0][0],
+            "low_trust": read("SELECT COUNT(*) FROM facts WHERE retired_at IS NULL AND trust_score < ?", (self._min_trust,))[0][0],
             "structural_recall": "on" if hrr._HAS_NUMPY else "off (numpy missing)",
             "database": str(self._store.db_path),
         })
@@ -781,8 +824,7 @@ class HolographicMemoryProvider(MemoryProvider):
     _TOOL_HANDLERS = {
         "fact_store": _tool_handler({
             "add": lambda self, a: self._add(a),
-            "search": lambda self, a: _results(self._counted(self._retriever.search(
-                a["query"], category=a.get("category"), min_trust=self._trust_floor(a), limit=_limit(a)))),
+            "search": lambda self, a: _results(self._counted(self._scoped_search(a))),
             "probe": lambda self, a: self._entity_query("probe", a),
             "related": lambda self, a: self._entity_query("related", a),
             "reason": lambda self, a: _results(self._counted(
@@ -792,6 +834,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 category=a.get("category"), limit=_limit(a), min_trust=float(a.get("min_trust", 0.0)))),
             "update": lambda self, a: self._update(a),
             "remove": lambda self, a: json.dumps({"removed": self._store.remove_fact(int(a["fact_id"]))}),
+            "history": lambda self, a: self._history(a),
             "list": lambda self, a: _results(self._store.list_facts(
                 category=a.get("category"), min_trust=float(a.get("min_trust", 0.0)), limit=_limit(a)), key="facts"),
             "stats": lambda self, a: self._stats(a),

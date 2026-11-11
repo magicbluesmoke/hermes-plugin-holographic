@@ -1,6 +1,7 @@
 """SQLite-backed fact store with entity resolution and trust scoring (single-user Hermes memory plugin)."""
 
 import contextlib
+import datetime
 import logging
 import os
 import re
@@ -33,7 +34,10 @@ CREATE TABLE IF NOT EXISTS facts (
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    hrr_vector      BLOB
+    hrr_vector      BLOB,
+    retired_at      TIMESTAMP,
+    retired_by      INTEGER,
+    event_date      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -44,14 +48,42 @@ CREATE TABLE IF NOT EXISTS entities (
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS fact_links (
+    from_fact INTEGER REFERENCES facts(fact_id) ON DELETE CASCADE,
+    to_fact   INTEGER REFERENCES facts(fact_id) ON DELETE CASCADE,
+    relation  TEXT NOT NULL DEFAULT 'temporal',
+    weight    REAL DEFAULT 1.0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (from_fact, to_fact, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_fact_links_from ON fact_links(from_fact);
+CREATE INDEX IF NOT EXISTS idx_fact_links_to   ON fact_links(to_fact);
+CREATE INDEX IF NOT EXISTS idx_fact_links_rel  ON fact_links(relation);
+
 CREATE TABLE IF NOT EXISTS fact_entities (
     fact_id   INTEGER REFERENCES facts(fact_id),
     entity_id INTEGER REFERENCES entities(entity_id),
     PRIMARY KEY (fact_id, entity_id)
 );
 
+CREATE TABLE IF NOT EXISTS entity_relations (
+    src_entity_id INTEGER REFERENCES entities(entity_id),
+    dst_entity_id INTEGER REFERENCES entities(entity_id),
+    relation      TEXT NOT NULL DEFAULT 'co_occurs',
+    weight        REAL DEFAULT 1.0,
+    trust_score   REAL DEFAULT 0.5,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (src_entity_id, dst_entity_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_er_src ON entity_relations(src_entity_id);
+CREATE INDEX IF NOT EXISTS idx_er_dst ON entity_relations(dst_entity_id);
+CREATE INDEX IF NOT EXISTS idx_er_relation ON entity_relations(relation);
+
 CREATE INDEX IF NOT EXISTS idx_facts_trust    ON facts(trust_score DESC);
 CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
+CREATE INDEX IF NOT EXISTS idx_facts_active   ON facts(retired_at) WHERE retired_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_facts_event    ON facts(event_date) WHERE event_date IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_entities_name  ON entities(name);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
@@ -102,6 +134,46 @@ _RE_QUOTED = (re.compile(r'(?<!\w)"([^"\n]+)"(?!\w)'), re.compile(r"(?<!\w)'([^'
               re.compile(r"„([^“”\n]+)[“”]"))
 _RE_AKA = re.compile(r"\s+(?:aka|a\.k\.a\.|also known as)\s+", re.IGNORECASE)
 _RE_NOT_A_NAME = re.compile(r"[=/\\@<>{}\[\]|`]|://|\b\d{1,3}(?:\.\d{1,3}){3}\b")
+
+# The date a fact states about itself, as opposed to the date it was written: ISO 8601, and "October 12, 2026".
+# A relative date ("yesterday", "last week") is deliberately not resolved — a guessed date is worse than the write
+# date, and it would be wrong forever after.
+_RE_ISO_DATE = re.compile(r"\b((?:19|20)\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b")
+_RE_MONTH_DATE = re.compile(
+    r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
+    r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+"
+    r"((?:19|20)\d{2})\b", re.IGNORECASE)
+_MONTHS = {name: number for number, name in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+
+def extract_event_date(text: str) -> str | None:
+    """The leftmost explicit date *text* states ('YYYY-MM-DD'), or None. A date that does not exist (2026-02-30) is
+    skipped rather than stored; the caller falls back to the write date."""
+    if not text:
+        return None
+    found = [(m.start(), f"{m.group(1)}-{m.group(2)}-{m.group(3)}") for m in _RE_ISO_DATE.finditer(text)]
+    found += [(m.start(), f"{int(m.group(3)):04d}-{_MONTHS[m.group(1)[:3].lower()]:02d}-{int(m.group(2)):02d}")
+              for m in _RE_MONTH_DATE.finditer(text)]
+    for _, value in sorted(found):
+        try:
+            datetime.date.fromisoformat(value)
+        except ValueError:
+            continue
+        return value
+    return None
+
+
+def _normalized_event_date(value: str | None) -> str | None:
+    """An explicit YYYY-MM-DD from the caller, if it is a real date; anything else is ignored (text inference wins)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.date.fromisoformat(value.strip()).isoformat()
+    except ValueError:
+        return None
+
+
 # A quoted span longer than this is a quotation ("she said: 'see you on Friday'"), not a name.
 _QUOTED_MAX_WORDS, _QUOTED_MAX_CHARS = 3, 60
 _PHRASE_MAX_WORDS, _ENTITY_MAX_CHARS = 5, 60
@@ -265,6 +337,13 @@ class MemoryStore:
         to pre-HRR DBs, and narrow the FTS update trigger of DBs created by older versions."""
         from hermes_state_wal import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="memory_store.db (holographic)")
+        # Retired facts (superseded, kept for their history) need these columns before the schema script runs its
+        # partial index over them; CREATE TABLE IF NOT EXISTS never adds a column to a table that already exists.
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
+        for column in ("retired_at TIMESTAMP", "retired_by INTEGER", "event_date TEXT"):
+            if columns and column.split()[0] not in columns:
+                self._conn.execute(f"ALTER TABLE facts ADD COLUMN {column}")
+                columns.add(column.split()[0])
         self._conn.executescript(_SCHEMA)
         if "hrr_vector" not in {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}:
             from hermes_cli.sqlite_util import add_column_if_missing
@@ -286,6 +365,9 @@ class MemoryStore:
         with self._tx():
             if "name_key" not in {r[1] for r in self._conn.execute("PRAGMA table_info(entities)")}:
                 self._conn.execute("ALTER TABLE entities ADD COLUMN name_key TEXT")
+            # 0.5.x: track when a fact was last retrieved, for retrieval-driven mutation (CMA property #3).
+            if "last_retrieved_at" not in {r[1] for r in self._conn.execute("PRAGMA table_info(facts)")}:
+                self._conn.execute("ALTER TABLE facts ADD COLUMN last_retrieved_at TIMESTAMP")
             # Aliases an older version deleted the entity of, or that point nowhere: drop before anything resolves them.
             self._conn.execute("DELETE FROM entity_aliases WHERE entity_id NOT IN (SELECT entity_id FROM entities)")
             # Legacy comma-separated aliases are imported BEFORE keys are reconciled: a merge deletes the source row.
@@ -299,9 +381,31 @@ class MemoryStore:
             self._reconcile_entity_keys()
             self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_key ON entities(name_key) WHERE name_key IS NOT NULL")
             self._sync_hrr_dim()
+            self._backfill_event_dates()
             self._bump()
             self._conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
+
+    def _backfill_event_dates(self) -> None:
+        """One pass over facts stored before the event_date column existed, guarded by a meta key: extracting a date
+        is cheap, but doing it on every open would be a needless full scan of the table."""
+        if self._meta("event_dates_backfilled") is not None:
+            return
+        updates = [(date, row["fact_id"]) for row in self._conn.execute("SELECT fact_id, content FROM facts")
+                   .fetchall() if (date := extract_event_date(row["content"]))]
+        if updates:
+            self._conn.executemany("UPDATE facts SET event_date = ? WHERE fact_id = ?", updates)
+        self._conn.execute("INSERT INTO meta (key, value) VALUES ('event_dates_backfilled', CURRENT_TIMESTAMP) "
+                           "ON CONFLICT(key) DO UPDATE SET value = CURRENT_TIMESTAMP")
+
+    def filter_by_event_date(self, fact_ids, since: str | None = None, before: str | None = None) -> set[int]:
+        """The subset of *fact_ids* whose own date (event_date, else the day it was written) is within [since, before)."""
+        ids = [int(i) for i in fact_ids]
+        if not ids:
+            return set()
+        sql = ("SELECT fact_id FROM facts WHERE fact_id IN ({}) AND COALESCE(event_date, date(created_at)) >= ? "
+               "AND COALESCE(event_date, date(created_at)) < ?").format(",".join("?" * len(ids)))
+        return {int(r[0]) for r in self.read(sql, [*ids, since or "0000-01-01", before or "9999-12-31"])}
 
     def _reconcile_entity_keys(self) -> None:
         """Fill missing name keys; merge entities whose keys collide into the oldest of them."""
@@ -424,43 +528,155 @@ class MemoryStore:
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
 
+    def neighbors(self, fact_id: int, relation: str | None = None, direction: str = "both") -> list[tuple[int, str, float]]:
+        """Return (fact_id, relation, weight) of facts linked to *fact_id* via fact_links.
+
+        direction='out' follows from_fact, 'in' follows to_fact, 'both' unions both. *relation*
+        filters to one relation type (e.g. 'temporal', 'causal', 'entity') or None for all.
+        """
+        out = []
+        rel_clause = " AND relation = ?" if relation else ""
+        params_rel = (relation,) if relation else ()
+        if direction in ("out", "both"):
+            q = "SELECT to_fact, relation, weight FROM fact_links WHERE from_fact = ?" + rel_clause
+            for r in self._conn.execute(q, (fact_id, *params_rel)):
+                out.append((int(r[0]), r[1], float(r[2])))
+        if direction in ("in", "both"):
+            q = "SELECT from_fact, relation, weight FROM fact_links WHERE to_fact = ?" + rel_clause
+            for r in self._conn.execute(q, (fact_id, *params_rel)):
+                out.append((int(r[0]), r[1], float(r[2])))
+        best = {}
+        for fid, rel, w in out:
+            if fid == fact_id:
+                continue
+            if fid not in best or w > best[fid][1]:
+                best[fid] = (rel, w)
+        return [(fid, rel, w) for fid, (rel, w) in best.items()]
+
+    def entity_neighbors(self, entity_ids: list[int], min_trust: float = 0.0,
+                         limit: int = 50) -> set[int]:
+        """Entity IDs reachable in one hop via entity_relations (graph memory). Returns the connected entity ids
+        (excluding the input set), ordered by edge weight desc. Used by retrieval to expand the candidate pool
+        beyond direct entity co-occurrence."""
+        if not entity_ids:
+            return set()
+        placeholders = ",".join("?" * len(entity_ids))
+        rows = self.read(
+            "SELECT dst_entity_id, weight FROM entity_relations "
+            "WHERE src_entity_id IN (" + placeholders + ") AND trust_score >= ? "
+            "UNION ALL "
+            "SELECT src_entity_id, weight FROM entity_relations "
+            "WHERE dst_entity_id IN (" + placeholders + ") AND trust_score >= ? "
+            "ORDER BY weight DESC LIMIT ?",
+            [*entity_ids, min_trust, *entity_ids, min_trust, limit],
+        )
+        result = set()
+        for r in rows:
+            eid = int(r[0])
+            if eid not in entity_ids:
+                result.add(eid)
+        return result
+
     def add_fact(self, content: str, category: str = "general", tags: str = "") -> int:
         """Insert a fact and return its fact_id; on duplicate content (UNIQUE) return the existing fact_id untouched."""
         return self.add_fact_status(content, category=category, tags=tags)[0]
 
     def add_fact_status(self, content: str, category: str = "general", tags: str = "", *,
-                        trust: float | None = None, entities=()) -> tuple[int, bool]:
+                        trust: float | None = None, entities=(), event_date: str | None = None) -> tuple[int, bool]:
         """(fact_id, created). Links extracted, declared (*entities*) and already known entities and stores the HRR
-        vector in the same transaction. *trust* overrides the default trust of a new fact."""
+        vector in the same transaction. *trust* overrides the default trust of a new fact; *event_date* (YYYY-MM-DD)
+        overrides the date inferred from the text, and is NULL when the text states none."""
         content = (content or "").strip()
         if not content:
             raise ValueError("content must not be empty")
         with self._tx():
             try:
                 fact_id: int = self._write(
-                    "INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)",
-                    (content, category, tags, _clamp_trust(self.default_trust if trust is None else trust))).lastrowid  # type: ignore[assignment]
+                    "INSERT INTO facts (content, category, tags, trust_score, event_date) VALUES (?, ?, ?, ?, ?)",
+                    (content, category, tags, _clamp_trust(self.default_trust if trust is None else trust),
+                     _normalized_event_date(event_date) or extract_event_date(content))).lastrowid  # type: ignore[assignment]
             except sqlite3.IntegrityError:
-                return int(self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))["fact_id"]), False
+                existing = self._one("SELECT fact_id, retired_at FROM facts WHERE content = ?", (content,))
+                if existing is None:  # a constraint other than UNIQUE(content): do not hide it
+                    raise
+                if existing["retired_at"] is not None:  # asserting a retired wording again makes it current again
+                    self._write("UPDATE facts SET retired_at = NULL, retired_by = NULL WHERE fact_id = ?",
+                                (existing["fact_id"],))
+                    self._invalidate_bank(category)
+                return int(existing["fact_id"]), False
             self._link_entities(fact_id, content, entities)
             self._compute_hrr_vector(fact_id, content)
+            self._link_temporal(fact_id)
             self._invalidate_bank(category)
             return fact_id, True
 
-    def replace_fact(self, old_id: int, content: str, category: str = "general", tags: str = "", *,
+    def replace_fact(self, old_id: int, content: str, category: str | None = None, tags: str = "", *,
                      entities=()) -> tuple[int, bool]:
         """Supersede fact *old_id* with *content* in one transaction: the new fact is stored (or found, if that text
-        already exists) and the old one removed. Returns (fact_id, created). KeyError if *old_id* does not exist.
-        The new fact starts at the default trust: a correction has not earned the old fact's feedback."""
+        already exists) and the old one retired — kept on disk, out of retrieval, linked to its replacement. Returns
+        (fact_id, created). KeyError if *old_id* does not exist. The new fact starts at the default trust: a
+        correction has not earned the old fact's feedback."""
         with self._tx():
             old = self._one("SELECT fact_id, content FROM facts WHERE fact_id = ?", (old_id,))
             if old is None:
                 raise KeyError(f"fact_id {old_id} not found")
+            old_id = self._supersede_head(old_id)  # superseding an older link replaces the current fact, not history
+            old = self._one("SELECT fact_id, content, category FROM facts WHERE fact_id = ?", (old_id,))
             if old["content"] == (content or "").strip():
                 return int(old_id), False
-            fact_id, created = self.add_fact_status(content, category=category, tags=tags, entities=entities)
-            self.remove_fact(old_id)
+            # a correction stays in the old fact's category unless the caller names one: a fix is not a re-filing
+            fact_id, created = self.add_fact_status(content, category=category or old["category"] or "general",
+                                                    tags=tags, entities=entities)
+            if fact_id != old_id:  # re-asserting an old wording reactivates it instead: nothing to retire
+                self.retire_fact(old_id, superseded_by=fact_id)
             return fact_id, created
+
+    def retire_fact(self, fact_id: int, *, superseded_by: int | None = None) -> bool:
+        """Take a fact out of retrieval without deleting it: the row, its text, its entities and its links stay
+        readable, so the correction can be reviewed or undone. Records the replacement as a fact_links edge
+        (relation='supersedes', from the retired fact to its successor) that fact_history walks in both directions.
+        Returns True if the row exists (already retired counts)."""
+        with self._tx():
+            row = self._one("SELECT fact_id, category, retired_at FROM facts WHERE fact_id = ?", (fact_id,))
+            if row is None:
+                return False
+            successor = int(superseded_by) if superseded_by is not None else None
+            if successor is not None and successor != int(fact_id):
+                self._write("INSERT OR IGNORE INTO fact_links (from_fact, to_fact, relation, weight) "
+                            "VALUES (?, ?, 'supersedes', 1.0)", (int(fact_id), successor))
+            if row["retired_at"] is not None:
+                return True
+            self._write("UPDATE facts SET retired_at = CURRENT_TIMESTAMP, retired_by = ? WHERE fact_id = ?",
+                        (successor, fact_id))
+            self._invalidate_bank(row["category"])
+            return True
+
+    def _supersede_head(self, fact_id: int) -> int:
+        """Follow supersedes edges forward to the newest fact of the chain (no-op for a fact never superseded)."""
+        seen = set()
+        while fact_id not in seen:
+            seen.add(fact_id)
+            row = self._one("SELECT to_fact FROM fact_links WHERE from_fact = ? AND relation = 'supersedes' "
+                            "ORDER BY created_at DESC LIMIT 1", (fact_id,))
+            if row is None:
+                break
+            fact_id = int(row["to_fact"])
+        return fact_id
+
+    def fact_history(self, fact_id: int) -> list[dict]:
+        """The supersession chain *fact_id* belongs to, oldest first: text, when it was stored and retired, and which
+        fact replaced it ('retired_by') or None while it is current. A never-superseded fact returns one entry."""
+        sql = """WITH RECURSIVE chain(id) AS (
+                     SELECT ?
+                     UNION
+                     SELECT CASE WHEN fl.from_fact = chain.id THEN fl.to_fact ELSE fl.from_fact END
+                       FROM fact_links fl JOIN chain ON chain.id IN (fl.from_fact, fl.to_fact)
+                      WHERE fl.relation = 'supersedes')
+                 SELECT f.fact_id, f.content, f.category, f.created_at, f.retired_at, f.retired_by
+                   FROM facts f JOIN chain ON chain.id = f.fact_id
+                  ORDER BY f.fact_id"""
+        return [{**dict(r), "status": "retired" if r["retired_at"] else "active"}
+                for r in self.read(sql, (int(fact_id),))]
 
     def update_fact(self, fact_id: int, content: str | None = None, trust_delta: float | None = None,
                     tags: str | None = None, category: str | None = None, *, entities=(), touch: bool = True) -> bool:
@@ -488,6 +704,7 @@ class MemoryStore:
                 other = self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))
                 raise DuplicateContentError(int(other["fact_id"]) if other else -1) from None
             if content is not None:  # re-extract entities (declared links survive a rewording) and recompute the vector
+                self._write("UPDATE facts SET event_date = ? WHERE fact_id = ?", (extract_event_date(content), fact_id))
                 kept = [r[0] for r in self._conn.execute(
                     "SELECT e.name FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id "
                     "WHERE fe.fact_id = ? AND e.entity_type = 'declared'", (fact_id,))]
@@ -521,12 +738,16 @@ class MemoryStore:
         category_clause = "AND category = ? " if category is not None else ""
         params = [min_trust] + ([category] if category is not None else []) + [limit]
         sql = ("SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, "
-               f"created_at, updated_at FROM facts WHERE trust_score >= ? {category_clause}"
+               f"created_at, updated_at, event_date FROM facts WHERE retired_at IS NULL AND trust_score >= ? {category_clause}"
                "ORDER BY trust_score DESC LIMIT ?")
         return [dict(r) for r in self.read(sql, params)]
 
     def count_facts(self) -> int:
-        return int(self.read("SELECT COUNT(*) FROM facts")[0][0])
+        """Active facts: retired (superseded) rows stay on disk for their history but are not memory any more."""
+        return int(self.read("SELECT COUNT(*) FROM facts WHERE retired_at IS NULL")[0][0])
+
+    def count_retired(self) -> int:
+        return int(self.read("SELECT COUNT(*) FROM facts WHERE retired_at IS NOT NULL")[0][0])
 
     def record_retrievals(self, fact_ids) -> int:
         """retrieval_count += 1 for facts handed to the model; returns the number of rows touched.
@@ -543,6 +764,21 @@ class MemoryStore:
                               f"WHERE fact_id IN ({','.join('?' * len(ids))})", ids)
             return max(cur.rowcount, 0)
 
+    def reinforce_retrievals(self, fact_ids) -> int:
+        """Retrieval-driven mutation (CMA property #3): bump trust slightly for facts actually handed to the
+        model and stamp last_retrieved_at. Gated by the caller via env flag; default off. Small delta (+0.01)
+        capped at 1.0; never suppresses (suppression of near-misses is a separate, riskier step)."""
+        ids = sorted({int(raw) for raw in fact_ids or ()
+                      if (isinstance(raw, int) and not isinstance(raw, bool)) or (isinstance(raw, str) and raw.isdigit())})
+        ids = ids[:_MAX_COUNTED_IDS]
+        if not ids:
+            return 0
+        with self._lock:
+            cur = self._write(
+                f"UPDATE facts SET trust_score = MIN(1.0, trust_score + 0.01), "
+                f"last_retrieved_at = CURRENT_TIMESTAMP "
+                f"WHERE fact_id IN ({','.join('?' * len(ids))})", ids)
+            return max(cur.rowcount, 0)
     def add_retrieval_counts(self, counts: dict) -> bool:
         """Add buffered recall counts ({fact_id: n}) in one transaction without waiting on another process's write
         lock (busy timeout 0 for this write only). False when the database was busy: the caller keeps the counts."""
@@ -654,6 +890,24 @@ class MemoryStore:
             if _valid_entity(left) and _valid_entity(right) and entity_key(left) != entity_key(right):
                 pairs.append((left, right))
         return pairs
+
+    def _link_temporal(self, fact_id: int, window: int = 5) -> None:
+        """Link a newly stored fact to the most recent prior facts as temporal predecessors.
+
+        Cheap, deterministic, no LLM: facts stored within the same session form a
+        chronological chain. Only forward links (older -> newer) are written; the
+        reverse direction is implied by traversing `to_fact`.
+        """
+        rows = self._conn.execute(
+            "SELECT fact_id FROM facts WHERE fact_id < ? AND retired_at IS NULL ORDER BY fact_id DESC LIMIT ?",
+            (fact_id, window),
+        ).fetchall()
+        for r in rows:
+            fid = r["fact_id"] if hasattr(r, "keys") else r[0]
+            self._write(
+                "INSERT OR IGNORE INTO fact_links (from_fact, to_fact, relation, weight) VALUES (?, ?, 'temporal', 1.0)",
+                (int(fid), fact_id),
+            )
 
     def _link_entities(self, fact_id: int, content: str, declared=()) -> None:
         """Link the fact to its entities: names extracted from the text, names the caller declared (a one-word name

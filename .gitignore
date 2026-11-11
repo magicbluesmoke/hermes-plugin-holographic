@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
+memory_store.db
+memory_store.db-wal
+memory_store.db-shm

@@ -65,11 +65,18 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   Facts are framed as data (`#id [trust] text`), one line each.
 - **add** takes `entities` (who the fact is about; needed for one-word names such as a first name, so later facts
   mentioning it in any form link to it), `keywords` (see [Synonyms](#synonyms-and-other-roots-keywords)) and
-  `supersedes` (the id of the fact it replaces). Its answer lists
+  `supersedes` (the id of the fact it replaces, which is retired rather than deleted — see **history**). Its answer lists
   `similar` facts and `possible_conflicts` (same subject, a different claim); the agent decides. Text that is not a
   fact (JSON, tool or chat-role markup, instruction-like phrasing, invisible characters, long blobs, >1000
   characters) is refused with the reason.
-- **stats** (what is stored and how much of it was ever recalled), **export** (Markdown view), **review**
+- **history** `{fact_id}`: the supersession chain a fact belongs to, oldest first and from either end — its text,
+  when it was stored and retired, and which fact replaced it. A correction stays in the old fact's category unless
+  one is named; re-asserting a retired wording makes that row current again instead of adding a duplicate.
+- **Event dates**: a fact stores the date it is *about* (`event_date`), taken from the leftmost explicit date in its
+  text (`2026-10-18`, `October 12, 2026`) or from an explicit `event_date` argument; relative words ("yesterday") are
+  not resolved. `search` takes `since`/`before` (YYYY-MM-DD) bounds over it, falling back to the day the fact was
+  written for undated facts.
+- **stats** (what is stored and how much of it was ever recalled; retired facts counted separately), **export** (Markdown view), **review**
   (clean-up candidates: low trust, never recalled for 60 days, near-duplicates), **enrich** (facts without keywords,
   most recalled first, to give keywords with `update`).
 - **entities** lists names with their aliases and fact counts; **alias** gives an entity a second name (or merges

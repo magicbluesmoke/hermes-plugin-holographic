@@ -68,7 +68,8 @@ class FactRetriever:
             logger.warning("holographic: skipping an unreadable HRR vector (%s)", exc)
             return None
 
-    def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10) -> list[dict]:
+    def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10,
+               since: str | None = None, before: str | None = None) -> list[dict]:
         """FTS5 candidates (limit*3) → Jaccard + HRR rerank → trust weighting → optional temporal decay
         0.5^(age_days / half_life). Returns fact dicts with 'score', sorted desc."""
         terms = query_terms(query or "")
@@ -79,6 +80,32 @@ class FactRetriever:
                 candidates[fact["fact_id"]] = fact
         for fact in self._scan_candidates(terms, category, min_trust, limit * 3):
             candidates.setdefault(fact["fact_id"], fact)  # fills in what FTS cannot see; FTS ranks what it found
+        # Graph expansion (Phase 4): traverse entity_relations from query-resolved entities to surface
+        # facts linked to structurally connected entities, not just direct co-occurrence.
+        query_entity_ids: set[int] = set()
+        for term in (query or "").split():
+            query_entity_ids.update(self.store.entity_ids(term))
+        graph_expanded_ids: set[int] = set()
+        if query_entity_ids:
+            connected = self.store.entity_neighbors(list(query_entity_ids), min_trust=min_trust or 0.0)
+            if connected:
+                rows = self.store.read(
+                    "SELECT DISTINCT fact_id FROM fact_entities WHERE entity_id IN ("
+                    + ",".join("?" * len(connected)) + ")",
+                    list(connected),
+                )
+                for r in rows:
+                    nid = int(r[0])
+                    if nid not in candidates:
+                        rows2 = self._rows([nid], category, min_trust)
+                        if rows2:
+                            candidates[nid] = rows2[0]
+                            graph_expanded_ids.add(nid)
+        if since or before:  # a fact's own date (else the day it was written): "what did we know as of ..." bounds
+            allowed = self.store.filter_by_event_date(candidates, since, before)
+            candidates = {fid: fact for fid, fact in candidates.items() if fid in allowed}
+        # Store for rerank boost
+        self._graph_expanded_ids = graph_expanded_ids
         return self._rerank(query, list(candidates.values()), limit)
 
     @staticmethod
@@ -94,10 +121,10 @@ class FactRetriever:
         """(fact_id, trust, Analysis) of every fact passing the filters. The rows are read on every call (the table is
         the truth; another process may have written); a fact is analysed again only when its text changed, so the
         first scan after start analyses every fact and later ones only what changed."""
-        where = [c for c, on in (("trust_score >= ?", min_trust is not None), ("category = ?", category)) if on]
+        where = ["retired_at IS NULL"] + [c for c, on in (("trust_score >= ?", min_trust is not None), ("category = ?", category)) if on]
         params = [p for p, on in ((min_trust, min_trust is not None), (category, category)) if on]
-        rows = self.store.read("SELECT fact_id, content, tags, trust_score FROM facts"
-                               + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY fact_id", params)
+        rows = self.store.read("SELECT fact_id, content, tags, trust_score FROM facts WHERE " + " AND ".join(where)
+                               + " ORDER BY fact_id", params)
         cache, out = self._analyses, []
         for row in rows:
             text = f'{row["content"]} {row["tags"] or ""}'
@@ -105,7 +132,7 @@ class FactRetriever:
             if hit is None or hit[0] != text:
                 hit = cache[row["fact_id"]] = (text, analyze(text))
             out.append((row["fact_id"], row["trust_score"], hit[1]))
-        if not where and len(cache) > len(out) + 1024:  # deleted facts: only an unfiltered read sees every fact
+        if min_trust is None and category is None and len(cache) > len(out) + 1024:  # deleted facts: only an unfiltered read sees every fact
             self._analyses = {fact_id: cache[fact_id] for fact_id, _, _ in out}
         return out
 
@@ -128,7 +155,7 @@ class FactRetriever:
         """Full rows of *ids*, the filters applied again: the fact may have changed since its text was read."""
         if not ids:
             return []
-        sql = (f"SELECT * FROM facts WHERE fact_id IN ({','.join('?' * len(ids))})"
+        sql = (f"SELECT * FROM facts WHERE fact_id IN ({','.join('?' * len(ids))}) AND retired_at IS NULL"
                + (" AND trust_score >= ?" if min_trust is not None else "") + (" AND category = ?" if category else ""))
         params = [*ids, *([min_trust] if min_trust is not None else []), *([category] if category else [])]
         return [dict(r) for r in self.store.read(sql, params)]
@@ -165,7 +192,7 @@ class FactRetriever:
             return []
         # content and tags: the agent's keywords (kept in tags) are searched like the text
         hits = " + ".join(f"(instr(lower(content || ' ' || COALESCE(tags, '')), ?) > 0) * {weight}" for _, weight in grams)
-        sql = (f"SELECT * FROM (SELECT f.*, ({hits}) AS gram_hits FROM facts f WHERE f.trust_score >= ?"
+        sql = (f"SELECT * FROM (SELECT f.*, ({hits}) AS gram_hits FROM facts f WHERE f.retired_at IS NULL AND f.trust_score >= ?"
                + (" AND f.category = ?" if category else "") + ") WHERE gram_hits > 0 ORDER BY gram_hits DESC LIMIT ?")
         rows = self.store.read(sql, [*(g for g, _ in grams), min_trust, *([category] if category else []), limit])
         total = sum(weight for _, weight in grams)
@@ -190,12 +217,20 @@ class FactRetriever:
                     query_vec = hrr.bind(hrr.encode_text(query, self.hrr_dim), self._atom(_ROLE_CONTENT))
                 hrr_sim = _shift(hrr.similarity(query_vec, fact_vec))
             relevance = self.fts_weight * fact.get("fts_rank", 0.0) + self.jaccard_weight * jaccard + self.hrr_weight * hrr_sim
+            # Boost graph-expanded candidates so they can compete with text-matched ones
+            if getattr(self, "_graph_expanded_ids", set()) and fact["fact_id"] in self._graph_expanded_ids:
+                relevance += 0.15
             fact["score"] = relevance * fact["trust_score"]
             if self.half_life > 0:
                 fact["score"] *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
         results = sorted(candidates, key=lambda x: x["score"], reverse=True)[:limit]
         for fact in results:
             fact.pop("hrr_vector", None)  # callers expect JSON-serializable dicts
+            if not fact.get("retired_at"):  # active by construction: do not carry the filter columns into the output
+                fact.pop("retired_at", None)
+                fact.pop("retired_by", None)
+            if fact.get("event_date") is None:  # no date stated in the text: the write date is what the caller has
+                fact.pop("event_date", None)
         return results
 
     def _linked_facts(self, entity_groups: list[list[int]], category: str | None, min_trust: float, limit: int) -> list[dict]:
@@ -203,7 +238,8 @@ class FactRetriever:
         joins = " INTERSECT ".join(
             f"SELECT fact_id FROM fact_entities WHERE entity_id IN ({','.join('?' * len(g))})" for g in entity_groups)
         params = [i for g in entity_groups for i in g] + [min_trust] + ([category] if category else []) + [limit]
-        sql = (f"SELECT {_F_COLUMNS} FROM facts f WHERE f.fact_id IN ({joins}) AND f.trust_score >= ? "
+        sql = (f"SELECT {_F_COLUMNS} FROM facts f WHERE f.fact_id IN ({joins}) AND f.retired_at IS NULL "
+               f"AND f.trust_score >= ? "
                + ("AND f.category = ? " if category else "") + "ORDER BY f.trust_score DESC, f.updated_at DESC, f.fact_id DESC LIMIT ?")
         results = [dict(r) for r in self.store.read(sql, params)]
         for fact in results:
@@ -283,8 +319,8 @@ class FactRetriever:
         a claim that only adds detail to the other ("likes apples" / "likes apples and bananas") and different
         topics about the same subject do not qualify. ``content_similarity`` is that word overlap. Word sets, so
         word order is ignored. Works without numpy."""
-        sql = ("SELECT fact_id, content, category, tags, trust_score, created_at, updated_at FROM facts "
-               "WHERE trust_score >= ?" + (" AND category = ?" if category else "")
+        sql = (f"SELECT fact_id, content, category, tags, trust_score, created_at, updated_at FROM facts "
+               "WHERE retired_at IS NULL AND trust_score >= ?" + (" AND category = ?" if category else "")
                + " ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 500")  # bound: the most recently changed facts
         rows = self.store.read(sql, [min_trust] + ([category] if category else []))
         if len(rows) < 2:
@@ -326,7 +362,7 @@ class FactRetriever:
 
     def _vector_rows(self, category: str | None, min_trust: float = 0.0) -> list:
         """All facts that carry an HRR vector and pass the trust filter, optionally within a category."""
-        where = "WHERE hrr_vector IS NOT NULL AND trust_score >= ?" + (" AND category = ?" if category else "")
+        where = "WHERE retired_at IS NULL AND hrr_vector IS NOT NULL AND trust_score >= ?" + (" AND category = ?" if category else "")
         return self.store.read(f"SELECT {_FACT_COLUMNS}, hrr_vector FROM facts {where}",
                                [min_trust] + ([category] if category else []))
 
@@ -340,7 +376,7 @@ class FactRetriever:
         category_clause = "AND f.category = ? " if category else ""
         params = [expression] + ([category] if category else []) + [min_trust, limit]
         sql = ("SELECT f.*, facts_fts.rank as fts_rank_raw FROM facts_fts JOIN facts f ON f.fact_id = facts_fts.rowid "
-               f"WHERE facts_fts MATCH ? {category_clause}AND f.trust_score >= ? ORDER BY facts_fts.rank LIMIT ?")
+               f"WHERE facts_fts MATCH ? {category_clause}AND f.retired_at IS NULL AND f.trust_score >= ? ORDER BY facts_fts.rank LIMIT ?")
         try:
             results = [dict(row) for row in self.store.read(sql, params)]
         except Exception as exc:  # a damaged index (expressions are built to be valid)
@@ -531,7 +567,7 @@ class FactRetriever:
         own_words = {w for e in own_entities for w in words(entity_names.get(e, ""))}
         own_keys, own_claim = content_keys(content), self._claim(content, own_words)
         similar, conflicts = [], []
-        for other in self.store.read("SELECT fact_id, content FROM facts WHERE fact_id IN ({})".format(
+        for other in self.store.read("SELECT fact_id, content FROM facts WHERE retired_at IS NULL AND fact_id IN ({})".format(
                 ",".join("?" * len(candidate_ids))), sorted(candidate_ids)):
             other_entities = links.get(other["fact_id"], set())
             overlap = soft_jaccard(own_keys, content_keys(other["content"]))
@@ -556,17 +592,20 @@ class FactRetriever:
                 seen.add(fact["fact_id"])
                 out.append({"fact_id": fact["fact_id"], "content": fact["content"], "trust_score": fact["trust_score"],
                             "retrieval_count": fact["retrieval_count"], "reason": reason})
-        for fact in self.store.read(f"SELECT {_FACT_COLUMNS} FROM facts WHERE trust_score < 0.3 ORDER BY trust_score LIMIT ?", (limit,)):
+        for fact in self.store.read(f"SELECT {_FACT_COLUMNS} FROM facts WHERE retired_at IS NULL AND trust_score < 0.3 "
+                                    "ORDER BY trust_score LIMIT ?", (limit,)):
             add(dict(fact), "low trust (rated unhelpful)")
         for fact in self.store.read(
-                f"SELECT {_FACT_COLUMNS} FROM facts WHERE retrieval_count = 0 AND julianday('now') - julianday(created_at) > ? "
+                f"SELECT {_FACT_COLUMNS} FROM facts WHERE retired_at IS NULL AND retrieval_count = 0 "
+                "AND julianday('now') - julianday(created_at) > ? "
                 "ORDER BY created_at LIMIT ?", (stale_days, limit)):
             add(dict(fact), f"never recalled in {stale_days}+ days")
         if len(out) >= limit:
             return out[:limit]
         # near-duplicates among the most recent 200 facts (bounded pair scan), the more trusted one kept
-        facts = sorted((dict(r) for r in self.store.read(f"SELECT {_FACT_COLUMNS} FROM facts ORDER BY fact_id DESC LIMIT 200")),
-                       key=lambda f: f["trust_score"], reverse=True)
+        facts = sorted((dict(r) for r in self.store.read(
+            f"SELECT {_FACT_COLUMNS} FROM facts WHERE retired_at IS NULL ORDER BY fact_id DESC LIMIT 200")),
+            key=lambda f: f["trust_score"], reverse=True)
         keyed = [(f, content_stems(f["content"])) for f in facts]
         for i, (better, a) in enumerate(keyed):
             for worse, b in keyed[i + 1:]:
