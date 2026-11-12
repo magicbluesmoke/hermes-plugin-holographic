@@ -42,6 +42,22 @@ def test_a_retired_row_is_dropped_on_open(tmp_path):
         reopened.close()
 
 
+def test_a_retired_column_with_no_retired_rows_drops_nothing(tmp_path):
+    """The column existing is not a reason to delete: only rows actually retired go."""
+    path = str(tmp_path / "mixed.db")
+    store = MemoryStore(path, hrr_dim=DIM)
+    fact, _ = store.add_fact_status("an absolutely current fact", category="general")
+    with store._tx():
+        store._write("ALTER TABLE facts ADD COLUMN retired_at TEXT")
+    store.close()
+
+    reopened = MemoryStore(path, hrr_dim=DIM)
+    try:
+        assert fact in {r["fact_id"] for r in reopened.read("SELECT fact_id FROM facts")}
+    finally:
+        reopened.close()
+
+
 def test_a_store_this_line_wrote_is_untouched(tmp_path):
     """No retired_at column: the migration must not invent one or delete anything."""
     path = str(tmp_path / "fresh.db")
