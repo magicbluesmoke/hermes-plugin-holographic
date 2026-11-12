@@ -58,7 +58,7 @@ def test_probe_returns_the_entitys_facts_not_the_most_trusted_ones(store):
 
 
 def test_probe_is_case_insensitive_and_honours_category(store):
-    alice, _ = _people_store(store)
+    _alice, _ = _people_store(store)
     in_category = store.add_fact("Alice Smith prefers tea", category="user_pref")
     results = FactRetriever(store, hrr_dim=DIM).probe("alice smith", category="user_pref")
     assert [r["fact_id"] for r in results] == [in_category]
@@ -145,7 +145,7 @@ def test_recall_paths_count_and_browsing_does_not(tmp_path):
     provider = _provider(tmp_path)
     fact = json.loads(provider.handle_tool_call("fact_store", {"action": "add", "content": "Alice Smith lives in Paris"}))
     fact_id = fact["fact_id"]
-    count = lambda: provider._store._one("SELECT retrieval_count FROM facts WHERE fact_id = ?", (fact_id,))[0]  # noqa: E731
+    count = lambda: provider._store._one("SELECT retrieval_count FROM facts WHERE fact_id = ?", (fact_id,))[0]
 
     block = provider.prefetch("where does Alice live, Paris?")
     provider._flush_counts()  # counts are buffered (0.3.0) and written at flush points

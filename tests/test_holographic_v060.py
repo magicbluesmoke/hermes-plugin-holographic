@@ -10,7 +10,6 @@ pytest.importorskip("numpy")
 pytest.importorskip("snowballstemmer")
 
 from hermes_plugin_holographic import HolographicMemoryProvider
-from hermes_plugin_holographic.retrieval import FactRetriever
 from hermes_plugin_holographic.store import MemoryStore
 from hermes_plugin_holographic.text import analyze, query_terms, run_grams
 

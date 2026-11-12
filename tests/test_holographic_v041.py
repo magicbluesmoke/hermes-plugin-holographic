@@ -205,11 +205,10 @@ def test_merge_reencodes_vectors_and_keeps_declared(store):
 
 def test_entity_cache_does_not_survive_a_rollback(store):
     store.add_fact("seed fact")
-    with pytest.raises(RuntimeError):
-        with store._tx():
-            store._resolve_entity("Alice Smith")
-            store.mentioned_entity_ids("alice smith")  # cache built inside the transaction
-            raise RuntimeError("rollback")
+    with pytest.raises(RuntimeError), store._tx():
+        store._resolve_entity("Alice Smith")
+        store.mentioned_entity_ids("alice smith")  # cache built inside the transaction
+        raise RuntimeError("rollback")
     bob = store._resolve_entity("Bob Brown")  # may reuse the rolled-back id
     fact = store.add_fact("alice smith likes coffee")
     linked = {r[0] for r in store.read("SELECT entity_id FROM fact_entities WHERE fact_id = ?", (fact,))}

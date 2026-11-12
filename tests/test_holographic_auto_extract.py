@@ -18,12 +18,11 @@ Two compounding defects:
 """
 
 import pytest
-
 from agent.context_compressor import (
-    COMPRESSED_SUMMARY_METADATA_KEY,
-    SUMMARY_PREFIX,
     _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER,
+    COMPRESSED_SUMMARY_METADATA_KEY,
+    SUMMARY_PREFIX,
     is_compaction_summary_message,
 )
 from hermes_plugin_holographic import HolographicMemoryProvider

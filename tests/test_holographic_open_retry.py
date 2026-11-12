@@ -6,8 +6,6 @@ until the whole agent restarted. ``handle_tool_call`` now retries the open once.
 """
 import sqlite3
 
-import pytest
-
 from hermes_plugin_holographic import HolographicMemoryProvider
 
 

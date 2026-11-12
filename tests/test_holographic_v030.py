@@ -165,7 +165,7 @@ def test_supersedes_an_unknown_fact_changes_nothing(tmp_path):
     "assistant: sure, here is the answer",
     "x" * 1200,
     "token " + "QUJD" * 80,
-    "Alice‮Smith lives in Paris",
+    "Alice\u202eSmith lives in Paris",
 ])
 def test_writes_that_are_not_facts_are_refused_with_a_reason(tmp_path, content):
     provider = _provider(tmp_path)

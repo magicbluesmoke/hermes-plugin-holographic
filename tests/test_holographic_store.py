@@ -15,8 +15,8 @@ import sqlite3
 import threading
 
 import pytest
-
 from hermes_plugin_holographic.store import MemoryStore
+
 
 @pytest.fixture(autouse=True)
 def _clean_shared_registry():

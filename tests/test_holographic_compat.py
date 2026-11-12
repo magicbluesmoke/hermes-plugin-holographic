@@ -36,7 +36,7 @@ def old(tmp_path_factory):
     pkg = tmp_path_factory.mktemp("old") / "holo_v011"
     pkg.mkdir()
     for name in ("store.py", "retrieval.py", "holographic.py"):
-        shown = subprocess.run(["git", "-C", str(REPO), "show", f"{OLD_TAG}:{name}"], capture_output=True)
+        shown = subprocess.run(["git", "-C", str(REPO), "show", f"{OLD_TAG}:{name}"], capture_output=True, check=False)
         if shown.returncode != 0:
             unavailable(f"tag {OLD_TAG} not available (fetch tags to run this test)")
         (pkg / name).write_bytes(shown.stdout)
@@ -45,7 +45,8 @@ def old(tmp_path_factory):
     module = importlib.util.module_from_spec(spec)
     sys.modules["holo_v011"] = module
     spec.loader.exec_module(module)
-    from holo_v011 import retrieval as old_retrieval, store as old_store  # noqa: E402
+    from holo_v011 import retrieval as old_retrieval
+    from holo_v011 import store as old_store
     return old_store, old_retrieval
 
 

@@ -210,7 +210,7 @@ GREETINGS = frozenset(_greeting_key(g) for g in """
     どうもありがとう|どうも|よろしく|よろしくお願いします|はじめまして|
     안녕|안녕하세요|안녕하십니까|좋은 아침|좋은 아침이에요|고마워|고마워요|고맙습니다|감사합니다|감사해요|잘 자|잘 자요|
     สวัสดี|สวัสดีครับ|สวัสดีค่ะ|อรุณสวัสดิ์|อรุณสวัสดิ์ครับ|อรุณสวัสดิ์ค่ะ|ขอบคุณ|ขอบคุณครับ|ขอบคุณค่ะ|ขอบคุณมาก|
-    ขอบคุณมากครับ|ขอบคุณมากค่ะ|ราตรีสวัสดิ์""".split("|"))
+    ขอบคุณมากครับ|ขอบคุณมากค่ะ|ราตรีสวัสดิ์""".split("|"))  # noqa: SIM905 - multilingual list reads better as one string
 
 
 def is_greeting(text: str) -> bool:
@@ -252,7 +252,7 @@ def _arabic_light(word: str) -> str:
 _BN_SUFFIXES = sorted({fold(unicodedata.normalize("NFC", s)) for s in """
     গুলোকে গুলোতে গুলোর গুলো গুলিকে গুলিতে গুলির গুলি দেরকে দের েরা রা টাকে টিকে টাতে টিতে টার টির টা টি খানা খানি
     য়েরা য়ের য়ে য় ের কে তে েতে র ে এর এ চ্ছিলাম চ্ছিলেন চ্ছিল চ্ছেন চ্ছিস চ্ছি চ্ছে ছিলাম ছিলেন ছিল ছেন ছিস ছি ছে
-    েছিলাম েছিলেন েছেন েছি েছে লাম লেন বেন বে বো তাম তেন ওয়ার ওয়া ানো""".split()}, key=len, reverse=True)
+    েছিলাম েছিলেন েছেন েছি েছে লাম লেন বেন বে বো তাম তেন ওয়ার ওয়া ানো""".split()}, key=len, reverse=True)  # noqa: SIM905
 
 
 def _bengali_stem(word: str) -> str:
@@ -308,9 +308,9 @@ def _keys(word: str, langs: tuple[str, ...]) -> frozenset:
 _ELISION = re.compile(r"^(?:l|d|j|m|n|s|t|c|qu|jusqu|lorsqu|puisqu|quoiqu|dell|all|nell|sull|dall|un)'(?=[^\W\d_])")
 # Pronouns after the verb, taken off only in text of that language: French inversion ("prend-il", "a-t-elle",
 # "est-ce", "vas-y"; not the noun "rendez-vous") and Portuguese enclisis ("chama-se", "lembra-me").
-_FR_CLITICS = frozenset("je tu il elle on nous vous ils elles ce moi toi lui leur le la les y en".split())
+_FR_CLITICS = frozenset("je tu il elle on nous vous ils elles ce moi toi lui leur le la les y en".split())  # noqa: SIM905 - one word list reads better than 20 literals
 _FR_COMPOUNDS = frozenset({"rendez-vous"})
-_PT_CLITICS = frozenset("se me te lhe lhes nos vos o a os as lo la los las no na nas".split())
+_PT_CLITICS = frozenset("se me te lhe lhes nos vos o a os as lo la los las no na nas".split())  # noqa: SIM905 - one word list reads better than 19 literals
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
@@ -520,12 +520,12 @@ CJK_FUNCTION = frozenset("的是了吗呢吧啊呀哦嗯么怎什哪谁几多少
 # Thai function words: a trigram inside them carries no topic, one touching them half (Thai letters, unlike Chinese
 # characters, mean nothing alone, so Thai is weighted by words found in the run, longest first).
 _TH_FUNCTION = sorted(set("""ของ ที่ และ ใน กับ ไม่ ได้ จะ แล้ว ไหม อะไร ยังไง อย่างไร คือ เป็น มี ให้ ครับ ค่ะ คะ นะ เลย ด้วย แบบ
-    ไหน เท่าไหร่ กี่ ว่า ก็ หรือ แต่ จาก ถึง เรา ฉัน ผม คุณ เขา นี้ นั้น หน่อย ควร""".split()), key=len, reverse=True)
+    ไหน เท่าไหร่ กี่ ว่า ก็ หรือ แต่ จาก ถึง เรา ฉัน ผม คุณ เขา นี้ นั้น หน่อย ควร""".split()), key=len, reverse=True)  # noqa: SIM905
 # Whole runs that are chat fillers, as "ok", "yes", "thanks" are in the English list: they recall nothing.
 FILLER_RUNS = frozenset("""はい うん ええ いいえ 了解 了解です りょうかい オーケー ありがとう ありがとうございます お願い お願いします
     よろしく そう そうです わかった わかりました 네 예 응 아니 아니요 좋아 좋아요 그래 그래요 알겠어 알겠어요 알겠습니다 오케이
     고마워 고마워요 감사 감사합니다 부탁해 부탁해요 ครับ ค่ะ คะ นะ จ้ะ จ้า โอเค ได้ ได้เลย ใช่ ขอบคุณ ขอบคุณครับ ขอบคุณค่ะ
-    ขอบคุณมาก""".split())
+    ขอบคุณมาก""".split())  # noqa: SIM905 - multilingual list reads better as one string
 _HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 CJK_NEGATORS = frozenset("不没无别非未")
 _MAX_GRAMS = 32

@@ -15,7 +15,6 @@ on shutdown, rather than at a non-deterministic GC time on an arbitrary thread.
 import sqlite3
 
 import pytest
-
 from hermes_plugin_holographic import HolographicMemoryProvider
 
 

@@ -21,21 +21,21 @@ from typing import Any
 # Each entry: (intent, compiled pattern list). First match wins.
 _INTENT_PATTERNS: list[tuple[str, list[re.Pattern]]] = [
     ("decision", [
-        re.compile(r"\b(decid|chose|chosen|conclusion|agreed|resolved|settled)\b", re.I),
-        re.compile(r"what (did we|was) (decide|decided|choose|chosen)", re.I),
-        re.compile(r"(decision|choice) (about|on|for|regarding)", re.I),
+        re.compile(r"\b(decid|chose|chosen|conclusion|agreed|resolved|settled)\b", re.IGNORECASE),
+        re.compile(r"what (did we|was) (decide|decided|choose|chosen)", re.IGNORECASE),
+        re.compile(r"(decision|choice) (about|on|for|regarding)", re.IGNORECASE),
     ]),
     ("causal", [
-        re.compile(r"\b(why|how (did|does|come|work)|because|reason|cause)\b", re.I),
-        re.compile(r"what (caused|led to|made)", re.I),
+        re.compile(r"\b(why|how (did|does|come|work)|because|reason|cause)\b", re.IGNORECASE),
+        re.compile(r"what (caused|led to|made)", re.IGNORECASE),
     ]),
     ("list", [
-        re.compile(r"\b(all|every|list|enumerate|everything|each)\b", re.I),
-        re.compile(r"what (are|were) (all|the) ", re.I),
+        re.compile(r"\b(all|every|list|enumerate|everything|each)\b", re.IGNORECASE),
+        re.compile(r"what (are|were) (all|the) ", re.IGNORECASE),
     ]),
     ("specific", [
-        re.compile(r"^(who|what|when|where|which)\b", re.I),
-        re.compile(r"\b(is|was|are|were) (the|a|an)\b", re.I),
+        re.compile(r"^(who|what|when|where|which)\b", re.IGNORECASE),
+        re.compile(r"\b(is|was|are|were) (the|a|an)\b", re.IGNORECASE),
     ]),
 ]
 
@@ -50,9 +50,9 @@ _INTENT_PARAMS: dict[str, dict[str, Any]] = {
 
 # Category hints: if the query mentions a category keyword, restrict to it.
 _CATEGORY_HINTS: list[tuple[str, re.Pattern]] = [
-    ("tool", re.compile(r"\b(tool|config|setting|command|script|plugin)\b", re.I)),
-    ("project", re.compile(r"\b(project|realm.?forge|kanban|board|task|card)\b", re.I)),
-    ("user_pref", re.compile(r"\b(prefer|preference|style|convention|rule)\b", re.I)),
+    ("tool", re.compile(r"\b(tool|config|setting|command|script|plugin)\b", re.IGNORECASE)),
+    ("project", re.compile(r"\b(project|realm.?forge|kanban|board|task|card)\b", re.IGNORECASE)),
+    ("user_pref", re.compile(r"\b(prefer|preference|style|convention|rule)\b", re.IGNORECASE)),
 ]
 
 

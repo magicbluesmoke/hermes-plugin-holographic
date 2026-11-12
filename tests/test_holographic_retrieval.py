@@ -103,6 +103,7 @@ def test_prefetch_recovers_prose_query(retriever_with_facts):
 
 from hermes_plugin_holographic import holographic as hrr
 
+
 def test_encode_functions_are_deterministic():
     """Soundness premise of the hoists: same input -> identical vector."""
     import numpy as np

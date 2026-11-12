@@ -14,7 +14,14 @@ pytest.importorskip("snowballstemmer")
 from hermes_plugin_holographic import HolographicMemoryProvider
 from hermes_plugin_holographic.retrieval import FactRetriever
 from hermes_plugin_holographic.store import MemoryStore
-from hermes_plugin_holographic.text import analyze, fold, is_greeting, is_identifier, query_terms, words
+from hermes_plugin_holographic.text import (
+    analyze,
+    fold,
+    is_greeting,
+    is_identifier,
+    query_terms,
+    words,
+)
 
 DIM = 512
 
