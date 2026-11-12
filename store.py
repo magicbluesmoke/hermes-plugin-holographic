@@ -80,6 +80,19 @@ CREATE INDEX IF NOT EXISTS idx_er_src ON entity_relations(src_entity_id);
 CREATE INDEX IF NOT EXISTS idx_er_dst ON entity_relations(dst_entity_id);
 CREATE INDEX IF NOT EXISTS idx_er_relation ON entity_relations(relation);
 
+-- Graph memory write path: a fact linking two entities creates their co_occurs edge. Must live in the
+-- schema init, not only in a migration: a fresh store without it silently has an empty graph, and
+-- retrieval's Phase 4 expansion then never fires.
+CREATE TRIGGER IF NOT EXISTS trg_fact_entities_edge
+AFTER INSERT ON fact_entities
+BEGIN
+  INSERT OR IGNORE INTO entity_relations (src_entity_id, dst_entity_id, relation, weight)
+  SELECT fe1.entity_id, fe2.entity_id, 'co_occurs', 1.0
+  FROM fact_entities fe1, fact_entities fe2
+  WHERE fe1.fact_id = NEW.fact_id AND fe2.fact_id = NEW.fact_id
+    AND fe1.entity_id < fe2.entity_id;
+END;
+
 CREATE INDEX IF NOT EXISTS idx_facts_trust    ON facts(trust_score DESC);
 CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
 CREATE INDEX IF NOT EXISTS idx_facts_active   ON facts(retired_at) WHERE retired_at IS NULL;
@@ -128,6 +141,12 @@ _MAX_COUNTED_IDS = 500  # record_retrievals batch cap (far under SQLite's bound-
 # Иванова"), short quoted terms (straight, curly, guillemets; straight quotes only at word boundaries, so
 # contractions like don't / it's never pair up), then both sides of "X aka Y".
 _RE_WORD = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*")  # letters only; hyphenated names stay one word
+# Wiki pointer facts ("[WIKI HINT ...] Wiki page: <wiki>/<section>/<slug>.md | ...") carry no capitalized names.
+# The path is the only identity such a line has; see MemoryStore._wiki_page_entities.
+_RE_WIKI_PAGE = re.compile(r"Wiki page:\s*([^\s|]+)")
+_WIKI_STRUCTURAL_SLUGS = frozenset({
+    "index", "schema", "log", "readme", "wiki index", "wiki log", "overview", "changelog", "notes", "todo",
+})
 _RE_TOKEN = re.compile(r"\w+(?:-\w+)*")  # aka sides may be handles with digits
 _RE_QUOTED = (re.compile(r'(?<!\w)"([^"\n]+)"(?!\w)'), re.compile(r"(?<!\w)'([^'\n]+)'(?!\w)"),
               re.compile(r"«([^»\n]+)»"), re.compile(r"“([^”\n]+)”"),
@@ -554,10 +573,13 @@ class MemoryStore:
         return [(fid, rel, w) for fid, (rel, w) in best.items()]
 
     def entity_neighbors(self, entity_ids: list[int], min_trust: float = 0.0,
-                         limit: int = 50) -> set[int]:
+                         limit: int = 50, max_degree: int | None = None) -> set[int]:
         """Entity IDs reachable in one hop via entity_relations (graph memory). Returns the connected entity ids
         (excluding the input set), ordered by edge weight desc. Used by retrieval to expand the candidate pool
-        beyond direct entity co-occurrence."""
+        beyond direct entity co-occurrence.
+
+        *max_degree* drops hub entities: a namespace entity such as "Realm Forge" or "hermes" connects to a whole
+        corpus, and traversing it yields arbitrary neighbours rather than related ones."""
         if not entity_ids:
             return set()
         placeholders = ",".join("?" * len(entity_ids))
@@ -568,14 +590,31 @@ class MemoryStore:
             "SELECT src_entity_id, weight FROM entity_relations "
             "WHERE dst_entity_id IN (" + placeholders + ") AND trust_score >= ? "
             "ORDER BY weight DESC LIMIT ?",
-            [*entity_ids, min_trust, *entity_ids, min_trust, limit],
+            [*entity_ids, min_trust, *entity_ids, min_trust, limit * 3 if max_degree is not None else limit],
         )
         result = set()
         for r in rows:
             eid = int(r[0])
-            if eid not in entity_ids:
+            if eid not in entity_ids and eid not in result:
+                if len(result) >= limit:
+                    break
                 result.add(eid)
+        if max_degree is not None and result:
+            degree = self.entity_degrees(list(result))
+            result = {eid for eid in result if degree.get(eid, 0) <= max_degree}
         return result
+
+    def entity_degrees(self, entity_ids: list[int]) -> dict[int, int]:
+        """{entity_id: number of graph edges touching it}. A hub/namespace entity connects to a whole corpus, so
+        neither expanding from it nor into it says anything about which neighbour is related to a query."""
+        ids = [int(e) for e in entity_ids or ()]
+        if not ids:
+            return {}
+        ph = ", ".join("?" * len(ids))
+        return {int(r[0]): int(r[1]) for r in self.read(
+            "SELECT e.entity_id, (SELECT COUNT(*) FROM entity_relations r "
+            "WHERE r.src_entity_id = e.entity_id OR r.dst_entity_id = e.entity_id) "
+            f"FROM entities e WHERE e.entity_id IN ({ph})", ids)}
 
     def add_fact(self, content: str, category: str = "general", tags: str = "") -> int:
         """Insert a fact and return its fact_id; on duplicate content (UNIQUE) return the existing fact_id untouched."""
@@ -891,6 +930,33 @@ class MemoryStore:
                 pairs.append((left, right))
         return pairs
 
+    @staticmethod
+    def _wiki_page_entities(text: str) -> tuple[str, ...]:
+        """Entities for a wiki pointer fact: "<wiki>/[section/]page-slug.md" yields the wiki namespace and the page slug.
+
+        Bulk wiki ingest writes facts as raw SQL (no entity extraction), so without this every re-ingested page stayed
+        invisible to the memory graph. The namespace and the slug are the only proper nouns such a line carries.
+        Hopeless slugs (index, schema, log, readme, the wiki root) are dropped: they are structural, not topics.
+        """
+        m = _RE_WIKI_PAGE.search(text or "")
+        if m is None:
+            return ()
+        path = m.group(1).strip().strip("<>[]()`'\"")
+        if path.lower().endswith(".md"):
+            path = path[:-3]
+        parts = [p for p in re.split(r"[/\\]+", path) if p and p not in {".", ".."}]
+        if len(parts) < 2:
+            return ()
+        names = [parts[0].replace("-", " ").replace("_", " "), parts[-1].replace("-", " ").replace("_", " ")]
+        out: list[str] = []
+        for name in (n.strip() for n in names):
+            key = entity_key(name)
+            if not key or key in _WIKI_STRUCTURAL_SLUGS or not _valid_entity(name):
+                continue
+            if key not in {entity_key(x) for x in out}:
+                out.append(name)
+        return tuple(out)
+
     def _link_temporal(self, fact_id: int, window: int = 5) -> None:
         """Link a newly stored fact to the most recent prior facts as temporal predecessors.
 
@@ -921,6 +987,8 @@ class MemoryStore:
             if not self.entity_ids(right):
                 ids.add(self.add_alias(left, right)["entity_id"])
         ids |= self.mentioned_entity_ids(content)
+        for name in self._wiki_page_entities(content):
+            ids.add(self._resolve_entity(name))
         for entity_id in sorted(ids):
             self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)", (fact_id, entity_id))
         self._link_declared(fact_id, declared)

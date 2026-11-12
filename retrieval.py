@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 _FACT_COLUMNS = "fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, created_at, updated_at"
 _F_COLUMNS = ", ".join(f"f.{c.strip()}" for c in _FACT_COLUMNS.split(","))
 _ROLE_ENTITY, _ROLE_CONTENT = hrr.ROLE_ENTITY, hrr.ROLE_CONTENT
+
+# Graph expansion bounds (Phase 4). Measured 2026-11-11: one generic query token ("review") resolved to a hub
+# entity and pulled 110 weakly related facts; with the old flat +0.15 they took ranks 2-8. Caps keep the pool
+# bounded, and graph discoveries are INTERLEAVED (every Nth slot) instead of score-boosted: they add recall
+# without displacing genuine text hits.
+_GRAPH_NEIGHBOUR_CAP = 25    # entity neighbours traversed per query
+_GRAPH_FACT_CAP = 40         # extra facts admitted from those neighbours
+_GRAPH_SLOT_EVERY = 3        # one graph discovery per N result slots, starting at slot 4
+_GRAPH_FIRST_SLOT = 4        # discoveries never take rank 1-3: the top text hits stay untouched
+_GRAPH_MIN_REL_RATIO = 0.5   # a discovery must carry >= half the best text score to be shown at all
+_GRAPH_MAX_ENTITY_DEGREE = 40  # hub entities (namespace/project nodes) are not traversed at all
 _PUNCT = ".,;:!?\"'()[]{}#@<>"
 # FTS5 operator characters. Inside a token they become spaces of a quoted phrase: "pve-01" -> "pve 01", the same two
 # tokens unicode61 indexed, adjacent (deleting them gave "pve01", which matches nothing).
@@ -82,19 +93,29 @@ class FactRetriever:
             candidates.setdefault(fact["fact_id"], fact)  # fills in what FTS cannot see; FTS ranks what it found
         # Graph expansion (Phase 4): traverse entity_relations from query-resolved entities to surface
         # facts linked to structurally connected entities, not just direct co-occurrence.
+        # Bounded: a generic token can resolve to a hub entity with a large degree, and an unbounded expansion
+        # would flood the candidate pool with weakly related facts (observed: 110 additions from one token).
         query_entity_ids: set[int] = set()
         for term in (query or "").split():
             query_entity_ids.update(self.store.entity_ids(term))
         graph_expanded_ids: set[int] = set()
         if query_entity_ids:
-            connected = self.store.entity_neighbors(list(query_entity_ids), min_trust=min_trust or 0.0)
+            # A namespace/project entity (the wiki root, "hermes", "ai agents") touches a whole corpus: expanding
+            # from it yields arbitrary neighbours, not related ones. Expand only when at least one resolved entity
+            # is specific enough to say something about its neighbourhood.
+            degrees = self.store.entity_degrees(list(query_entity_ids))
+            specific = [eid for eid in query_entity_ids
+                        if degrees.get(eid, 0) <= _GRAPH_MAX_ENTITY_DEGREE]
+            connected = self.store.entity_neighbors(specific, min_trust=min_trust or 0.0,
+                                                   limit=_GRAPH_NEIGHBOUR_CAP,
+                                                   max_degree=_GRAPH_MAX_ENTITY_DEGREE) if specific else set()
             if connected:
                 rows = self.store.read(
                     "SELECT DISTINCT fact_id FROM fact_entities WHERE entity_id IN ("
                     + ",".join("?" * len(connected)) + ")",
                     list(connected),
                 )
-                for r in rows:
+                for r in rows[:_GRAPH_FACT_CAP]:
                     nid = int(r[0])
                     if nid not in candidates:
                         rows2 = self._rows([nid], category, min_trust)
@@ -208,6 +229,11 @@ class FactRetriever:
         # Query vector is loop-invariant; encode lazily on the first candidate that carries an HRR vector
         # so stores whose hrr_vector was never backfilled don't pay for it.
         query_vec = None  # bind(encode_text(query), ROLE_CONTENT): the shape a fact's content is stored in
+        # Graph recall: a graph-expanded fact is a DISCOVERY, not a better text match. Scored (and boosted) it either
+        # displaced real hits (flat +0.15) or never surfaced (pure relevance). So rank text matches on relevance and
+        # interleave graph discoveries into every _GRAPH_SLOT_EVERY-th slot: the graph adds recall without ever
+        # pushing a genuine text hit out of the top two positions.
+        expanded = getattr(self, "_graph_expanded_ids", set())
         for fact in candidates:
             jaccard = self._jaccard_similarity(query_tokens, content_stems(f'{fact["content"]} {fact.get("tags") or ""}'))
             hrr_sim = 0.5  # neutral
@@ -216,14 +242,30 @@ class FactRetriever:
                 if query_vec is None:
                     query_vec = hrr.bind(hrr.encode_text(query, self.hrr_dim), self._atom(_ROLE_CONTENT))
                 hrr_sim = _shift(hrr.similarity(query_vec, fact_vec))
-            relevance = self.fts_weight * fact.get("fts_rank", 0.0) + self.jaccard_weight * jaccard + self.hrr_weight * hrr_sim
-            # Boost graph-expanded candidates so they can compete with text-matched ones
-            if getattr(self, "_graph_expanded_ids", set()) and fact["fact_id"] in self._graph_expanded_ids:
-                relevance += 0.15
+            relevance = (self.fts_weight * fact.get("fts_rank", 0.0)
+                         + self.jaccard_weight * jaccard + self.hrr_weight * hrr_sim)
             fact["score"] = relevance * fact["trust_score"]
             if self.half_life > 0:
                 fact["score"] *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
-        results = sorted(candidates, key=lambda x: x["score"], reverse=True)[:limit]
+        ranked = sorted(candidates, key=lambda x: x["score"], reverse=True)
+        if expanded:
+            text_hits = [f for f in ranked if f["fact_id"] not in expanded]
+            top_score = ranked[0]["score"] if ranked else 0.0
+            # Only discoveries plausibly about the query: a co-occurrence edge alone (score ~0.05 against a 0.30
+            # top hit) is not evidence. This keeps junk hub neighbours out while still surfacing related facts.
+            discoveries = [f for f in ranked
+                           if f["fact_id"] in expanded and f["score"] >= _GRAPH_MIN_REL_RATIO * top_score]
+            merged, di = [], 0
+            for fact in text_hits:
+                merged.append(fact)
+                slot = len(merged) + 1  # 1-based position the next appended result would take
+                if (di < len(discoveries) and slot >= _GRAPH_FIRST_SLOT
+                        and (slot - _GRAPH_FIRST_SLOT) % _GRAPH_SLOT_EVERY == 0):
+                    merged.append(discoveries[di])
+                    di += 1
+            merged.extend(discoveries[di:])
+            ranked = merged
+        results = ranked[:limit]
         for fact in results:
             fact.pop("hrr_vector", None)  # callers expect JSON-serializable dicts
             if not fact.get("retired_at"):  # active by construction: do not carry the filter columns into the output
