@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import threading
 from collections import Counter, OrderedDict
 from pathlib import Path
@@ -254,6 +255,16 @@ def _revision(fact: dict) -> tuple:
 def _one_line(text: str, limit: int = _PREFETCH_LINE_CHARS) -> str:
     flat = " ".join((text or "").split())
     return flat if len(flat) <= limit else flat[:limit - 1] + "…"
+
+
+# SQLite raises these from THIS process when another process rewrote or checkpointed the WAL under a
+# connection that has been cached for hours; the file itself is usually fine (confirm with
+# `sqlite3 <db> "PRAGMA integrity_check"` rather than trusting the error text).
+_STALE_CONN_ERRORS = ("malformed", "not a database", "file is encrypted", "disk i/o error")
+
+
+def _is_stale_connection_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.DatabaseError) and any(s in str(exc).lower() for s in _STALE_CONN_ERRORS)
 
 
 class HolographicMemoryProvider(MemoryProvider):
@@ -525,13 +536,42 @@ class HolographicMemoryProvider(MemoryProvider):
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
 
     @_serialized
+    def _reopen_active_store(self) -> bool:
+        """Drop the cached store of the active scope and open a fresh connection. True if it came back.
+
+        A connection cached for a long-lived process can be poisoned by external writes/checkpoints of the
+        same file; every later statement then fails with "database disk image is malformed" even though the
+        file is intact. Reopening is the fix — do not delete facts or restore a backup on that error.
+        """
+        key = self._scope_key
+        entry = self._stores.pop(key, None) if key is not None else None
+        # Buffered recall counts belong to the dead connection; do not flush them into it.
+        if key is not None:
+            self._pending.pop(key, None)
+        if entry is not None:
+            try:
+                entry[0].close()
+            except Exception:  # noqa: BLE001 - a broken connection must not block the reopen
+                pass
+        try:
+            self._activate(key)
+        except Exception:  # noqa: BLE001 - reported by the caller as a tool error
+            return False
+        return self._store is not None
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
         if self._store is None:
-            reason = self._init_error or ("no user identity in this context (per-user memory)"
-                                          if self._scope == "user" else "not initialised")
-            return tool_error(f"Holographic memory is unavailable: {reason}")
+            # A failed open is sticky for the process lifetime (_init_error survives every turn), so a store
+            # repaired or restored from backup mid-session would stay unreachable until restart. Retry the
+            # same scope once per call; reopening is scope-preserving and harmless when there is no identity.
+            if self._init_error and self._scope_key is not None and self._reopen_active_store():
+                self._init_error = ""
+            if self._store is None:
+                reason = self._init_error or ("no user identity in this context (per-user memory)"
+                                              if self._scope == "user" else "not initialised")
+                return tool_error(f"Holographic memory is unavailable: {reason}")
         if not self._writable and (tool_name == "fact_feedback" or args.get("action") in _WRITE_ACTIONS):
             return tool_error("The fact store is read-only in this context (subagent, cron or flush); "
                               "only the main agent writes facts.")
@@ -543,6 +583,12 @@ class HolographicMemoryProvider(MemoryProvider):
             return json.dumps({"updated": False, "duplicate_of": exc.fact_id,
                                "reason": "another fact already says exactly this; remove one of them instead"})
         except Exception as exc:
+            if _is_stale_connection_error(exc) and self._reopen_active_store():
+                try:
+                    return self._TOOL_HANDLERS[tool_name](self, args)
+                except Exception as retry_exc:  # noqa: BLE001 - surfaced to the caller
+                    return tool_error(f"{retry_exc} (on a freshly opened connection; if this persists, "
+                                      f"check the file with: sqlite3 {self._store.db_path} \"PRAGMA integrity_check\")")
             return tool_error(str(exc))
 
     # -- session boundaries --------------------------------------------------------------------------------------
