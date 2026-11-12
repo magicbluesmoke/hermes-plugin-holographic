@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import unicodedata
 from pathlib import Path
+from typing import ClassVar, Self
 
 from . import holographic as hrr
 from .text import UNSEGMENTED, analyze, name_keys
@@ -201,7 +202,7 @@ _SENTENCE_STARTERS = frozenset("""
     a an and as at but by for from here if in it its my no not now of on or our so that the then there these this
     those to today tomorrow we when where yes yesterday you your
     а в во вот вчера да если завтра и или когда мой моя мои на наш наша наши не но однако по при сегодня так там
-    тут у это этот эта эти""".split())
+    тут у это этот эта эти""".split())  # noqa: SIM905 - one word list beats a 50-element literal here
 _ENTITY_NAMES_SQL = "SELECT e.name FROM entities e JOIN fact_entities fe ON fe.entity_id = e.entity_id WHERE fe.fact_id = ?"
 
 
@@ -309,7 +310,7 @@ class MemoryStore:
     impossible within a process. Refcounted: closing one instance never tears the connection out from under a
     sibling. Every multi-statement write runs in one transaction, so a failure leaves nothing half-written."""
 
-    _shared: dict = {}
+    _shared: ClassVar[dict] = {}
     _shared_guard = threading.Lock()
 
     def __init__(self, db_path: "str | Path | None" = None, default_trust: float = 0.5, hrr_dim: int = 1024, *,
@@ -1102,8 +1103,8 @@ class MemoryStore:
                 try:
                     with entry["lock"]:
                         entry["conn"].close()
-                except Exception:
-                    pass  # an already-closed/broken connection must not abort releasing siblings
+                except Exception as exc:  # noqa: BLE001 - any failure to close must not abort releasing siblings
+                    logger.debug("holographic: closing a released store failed (%s: %s)", type(exc).__name__, exc)
         return len(doomed)
 
     def close(self) -> None:
@@ -1124,7 +1125,7 @@ class MemoryStore:
                         MemoryStore._shared.pop(self._key, None)
             self._entry = None
 
-    def __enter__(self) -> "MemoryStore":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:

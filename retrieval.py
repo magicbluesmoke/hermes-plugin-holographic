@@ -5,17 +5,34 @@ from __future__ import annotations
 
 import logging
 import math
-import re
-from datetime import datetime, timezone
+import sqlite3
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .store import MemoryStore
 
 from . import holographic as hrr
-from .text import (CJK_NEGATORS, CLAIM_WORDS, CONTRASTIVE, NEGATORS, UNSEGMENTED, analyze, content_chars,
-                   content_keys, content_stems, gram_coverage, is_greeting, is_sea, query_grams, query_terms, run_grams,
-                   soft_jaccard, soft_overlap, words)
+from .text import (
+    CJK_NEGATORS,
+    CLAIM_WORDS,
+    CONTRASTIVE,
+    NEGATORS,
+    UNSEGMENTED,
+    analyze,
+    content_chars,
+    content_keys,
+    content_stems,
+    gram_coverage,
+    is_greeting,
+    is_sea,
+    query_grams,
+    query_terms,
+    run_grams,
+    soft_jaccard,
+    soft_overlap,
+    words,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +183,7 @@ class FactRetriever:
             try:
                 needed = bool(self.store.read("SELECT 1 FROM facts_fts WHERE facts_fts MATCH ? LIMIT 1",
                                               (f"{_INDONESIAN_PROBE} OR {_GERMAN_PROBE}",)))
-            except Exception:  # a damaged index: the scan does not need it
+            except sqlite3.DatabaseError:  # a damaged index: the scan does not need it
                 needed = True
             if not needed:
                 scan = [t for t in scan if not t.fts_ok]
@@ -361,7 +378,7 @@ class FactRetriever:
         a claim that only adds detail to the other ("likes apples" / "likes apples and bananas") and different
         topics about the same subject do not qualify. ``content_similarity`` is that word overlap. Word sets, so
         word order is ignored. Works without numpy."""
-        sql = (f"SELECT fact_id, content, category, tags, trust_score, created_at, updated_at FROM facts "
+        sql = ("SELECT fact_id, content, category, tags, trust_score, created_at, updated_at FROM facts "
                "WHERE retired_at IS NULL AND trust_score >= ?" + (" AND category = ?" if category else "")
                + " ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 500")  # bound: the most recently changed facts
         rows = self.store.read(sql, [min_trust] + ([category] if category else []))
@@ -421,7 +438,7 @@ class FactRetriever:
                f"WHERE facts_fts MATCH ? {category_clause}AND f.retired_at IS NULL AND f.trust_score >= ? ORDER BY facts_fts.rank LIMIT ?")
         try:
             results = [dict(row) for row in self.store.read(sql, params)]
-        except Exception as exc:  # a damaged index (expressions are built to be valid)
+        except sqlite3.DatabaseError as exc:  # a damaged index (expressions are built to be valid)
             # Logged, not raised: recall must not take the turn down; a silent [] hides a broken index.
             logger.warning("holographic: FTS5 search failed (%s: %s)", type(exc).__name__, exc)
             return []
@@ -456,7 +473,7 @@ class FactRetriever:
     def _doc_freq(self, term) -> int:
         try:
             return int(self.store.read("SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ?", (term.fts(_FTS_OPERATORS),))[0][0])
-        except Exception:
+        except sqlite3.DatabaseError:
             return 0
 
     def relevant(self, query: str, candidates: list[dict], min_coverage: float = 0.3) -> list[dict]:
@@ -622,7 +639,9 @@ class FactRetriever:
                 conflicts.append(entry)  # before duplicates: "budget is 500" / "budget is 600" is an update
             elif overlap >= 0.7 and own_claim[1] == other_claim[1]:
                 similar.append(entry)
-        by_overlap = lambda xs: sorted(xs, key=lambda e: e["word_overlap"], reverse=True)[:limit]  # noqa: E731
+        def by_overlap(xs: list[dict]) -> list[dict]:
+            return sorted(xs, key=lambda e: e["word_overlap"], reverse=True)[:limit]
+
         return {"similar": by_overlap(similar), "possible_conflicts": by_overlap(conflicts)}
 
     def review(self, limit: int = 20, stale_days: int = 60) -> list[dict]:
@@ -665,8 +684,10 @@ class FactRetriever:
         if not self.half_life or not timestamp_str:
             return 1.0
         try:
-            ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00")) if isinstance(timestamp_str, str) else timestamp_str
-            age_days = (datetime.now(timezone.utc) - (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc))).total_seconds() / 86400
+            ts = datetime.fromisoformat(timestamp_str) if isinstance(timestamp_str, str) else timestamp_str  # "Z" is parsed since 3.11
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)  # stored timestamps are naive UTC by contract
+            age_days = (datetime.now(UTC) - ts).total_seconds() / 86400
             return 1.0 if age_days < 0 else math.pow(0.5, age_days / self.half_life)
         except (ValueError, TypeError):
             return 1.0
