@@ -120,3 +120,29 @@ def test_pointer_format_in_code_is_not_a_pointer(tmp_path):
         "```\n[WIKI HINT] Wiki page: ai-agents/entities/llama-cpp.md\n```", category="general")
     for fact in (inline, fenced):
         assert not _names(store, fact) & {"ai agents", "llama cpp"}
+
+
+def test_a_pointer_right_after_a_fenced_block_is_read(tmp_path):
+    """Code is blanked out, not the line breaks it covered: a pointer on the line after a closing fence still starts
+    a line (review: the masked newline left "[" mid-line and the page was missed)."""
+    store = _store(tmp_path)
+    fact, _ = store.add_fact_status(
+        "Example:\n```\ncode here\n```\n[WIKI HINT - consult when relevant] Wiki page: gaming/openmw.md | "
+        "type: entity", category="general")
+    assert _names(store, fact) >= {"gaming", "openmw"}
+
+
+def test_a_protocol_relative_url_is_not_a_page(tmp_path):
+    """A value starting with "//" is a URL too: the "://" check alone linked "example.com" and "foo"."""
+    store = _store(tmp_path)
+    fact, _ = store.add_fact_status(
+        "[WIKI HINT] Wiki page: //example.com/wiki/foo.md | type: entity", category="general")
+    assert _names(store, fact) == set()
+
+
+def test_a_leading_bom_does_not_hide_the_line(tmp_path):
+    """A fact stored with a byte-order mark still starts its first line with the marker."""
+    store = _store(tmp_path)
+    fact, _ = store.add_fact_status(
+        "\ufeff[WIKI HINT] Wiki page: gaming/morrowind.md | type: entity", category="general")
+    assert _names(store, fact) >= {"gaming", "morrowind"}

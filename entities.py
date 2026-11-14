@@ -24,7 +24,21 @@ logger = logging.getLogger(__name__)
 # proper noun on it. Its namespace and page slug are linked as entities instead. The line is anchored to the hint
 # marker at the start of a line, and a scheme is refused: an ordinary note saying "Wiki page: <url>" is not a page
 # of this wiki and made entities of "https:" and "Foo" (review).
-_RE_WIKI_PAGE = re.compile(r"(?m)^[ \t]*\[WIKI HINT\b[^\]\n]*\][ \t]*Wiki page:[ \t]*([^\s|]+)")
+_RE_WIKI_PAGE = re.compile(r"(?m)^[ \t]*\ufeff?\[WIKI HINT\b[^\]\n]*\][ \t]*Wiki page:[ \t]*([^\s|]+)")
+
+
+def _without_code_lines(text: str) -> str:
+    """_without_code(text), but with the line breaks its masking covered kept.
+
+    Code is blanked with NUL so no name runs across it, the newlines included; a line that follows a fenced block then
+    starts mid-line to a reader, and a pointer there was missed (review). Line breaks are not names either, so keeping
+    them costs nothing."""
+    masked = _without_code(text)
+    if masked == text:
+        return masked
+    return "".join("\n" if original == "\n" else blank for original, blank in zip(text, masked))
+
+
 _WIKI_STRUCTURAL_SLUGS = frozenset({
     "index", "schema", "log", "readme", "wiki index", "wiki log", "overview", "changelog", "notes", "todo",
 })
@@ -609,12 +623,12 @@ class EntityMixin:
         removed: a path is text, and text never recreates a tombstoned name (see _tombstoned). The text is read with
         code blanked out, as _extract_entities reads it: a fact that shows the format in backticks is documentation,
         not a pointer (review)."""
-        m = _RE_WIKI_PAGE.search(_without_code(unicodedata.normalize("NFC", text or "")))
+        m = _RE_WIKI_PAGE.search(_without_code_lines(unicodedata.normalize("NFC", text or "")))
         if m is None:
             return ()
         path = m.group(1).strip().strip("<>[]()`'\"")
-        if "://" in path:
-            return ()  # a URL is no page of this wiki, whatever follows "Wiki page:"
+        if path.startswith("//") or "://" in path:
+            return ()  # a URL, or a protocol-relative one, is no page of this wiki
         if path.lower().endswith(".md"):
             path = path[:-3]
         parts = [p for p in re.split(r"[/\\]+", path) if p and p not in {".", ".."}]

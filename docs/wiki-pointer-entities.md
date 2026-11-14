@@ -30,17 +30,36 @@ Dropped on purpose:
 - a path with no namespace (`llama-cpp.md`): that is not a pointer to a wiki page;
 - a name `delete_entity` removed: a path is text, and text never lifts a tombstone.
 
+**The namespace is a hub, and that is deliberate.** A multi-word namespace (`ai agents`) becomes a known entity, so
+from then on ordinary facts that say the phrase are linked to it as well — at add time, and in the second pass of
+`rebuild_entity_index` ("Our team builds AI agents for clients" is linked to `ai agents`). A prefetch for a message
+that mentions the phrase can therefore pull the wiki's pages into its entity stream. That is the cost of grouping
+the pages of one wiki under one name; linking only the page slug would avoid it and lose the grouping. Single-word
+namespace slugs (`memory`, `python`) spread the same way but are noisier, as any fact using the word joins in. Two
+wikis with a page called `setup` share one `setup` entity for the same reason.
+
+## Limits
+
+- Only the **first** pointer line of a fact is read (`re.search`).
+- The `[WIKI HINT` marker is **case-sensitive**: `[wiki hint …]` is not a pointer.
+- A page **renamed or moved** gets a new pointer text, so it is stored as a new fact and the old fact keeps its old
+  links. A writer that keeps a page → fact id map can `change` or `end` the old fact on a rename.
+
 ## What is not a pointer
 
 The line is read only in this shape, so an ordinary note cannot turn words into pages:
 
 - it must start a line, with the `[WIKI HINT …]` marker before `Wiki page:`;
-- a value carrying a scheme (`https://…`) is refused: a URL is no page of this wiki;
+- a value carrying a scheme (`https://…`) or starting with `//` (a protocol-relative URL) is refused: a URL is no
+  page of this wiki;
+- a leading byte-order mark is ignored: the marker still starts the fact;
 - Markdown code is blanked out before the line is read — a fact that shows the format in backticks or a fenced block
-  is documentation, not a pointer.
+  is documentation, not a pointer. The line breaks code covered are kept, so a pointer on the line right after a
+  closing fence is read as usual.
 
 ```
 Wiki page: https://en.wikipedia.org/wiki/Foo is a good intro     # no entities
+[WIKI HINT] Wiki page: //example.com/wiki/foo.md                 # no entities (protocol-relative URL)
 see Wiki page: gaming/openmw.md for the details                  # no entities (not a line of its own)
 `[WIKI HINT] Wiki page: ai-agents/entities/llama-cpp.md`         # no entities (code)
 ```
