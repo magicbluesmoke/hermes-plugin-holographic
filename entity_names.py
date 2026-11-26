@@ -46,9 +46,13 @@ _RE_VERSION = re.compile(r"[vV]?\d+(?:\.\d+)+")  # 0.17.0, v2.1: a release, not 
 _PHRASE_MAX_WORDS, _ENTITY_MAX_CHARS = 5, 60
 _AKA_MAX, _AKA_WINDOW = 16, 4 * _ENTITY_MAX_CHARS  # "X aka Y" read per text, and how far from the "aka" (0.16.0)
 # Capitalized only because they open a sentence: dropped from the front of a capitalized run ("So Apple").
+# Interrogatives and sentence-opening verbs are here too: a run cut at its first lower-case word ("How Hermes",
+# "Every Hermes aux consumer", "Requires Hermes 2.1", "Use when") is a sentence start, not a name.
 _SENTENCE_STARTERS = frozenset("""
     a an and as at but by for from here if in it its my no not now of on or our so that the then there these this
     those to today tomorrow we when where yes yesterday you your
+    how what why who whom whose which every each requires require use using turn turns add avoid check consider
+    keep make never only prefer run set since some update
     а в во вот вчера да если завтра и или когда мой моя мои на наш наша наши не но однако по при сегодня так там
     тут у это этот эта эти""".split())
 
