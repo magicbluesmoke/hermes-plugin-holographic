@@ -148,6 +148,50 @@ def _scan_language(query: str) -> bool:
     return analysis.determined and not _SCAN_LANGUAGES.isdisjoint(analysis.langs)
 
 
+# A fact that names a fact it replaces ("replaces #3890", "superseded by #4336") states its own precedence.
+# Retrieval honors that statement: the newer fact takes the stale fact's slot and the stale fact drops to the tail,
+# so the top answer is not a claim a newer fact already corrected. Two gates keep issue/PR numbers out of it: the
+# sentence holding the reference must carry a replacement cue, and the referencing fact must be newer.
+_SUPERSEDE_REF = re.compile(r"#(\d{2,5})\b")
+_SUPERSEDE_CUE = re.compile(
+    r"replac|supersed|no longer|instead of|obsolet|deprecat|now false|now disabled", re.I)
+
+
+def _demote_superseded(ranked: list) -> list:
+    """Reorder *ranked* so an explicitly replaced fact sits after the fact that replaced it."""
+    if len(ranked) < 2:
+        return ranked
+    text, created = {}, {}
+    for fact in ranked:
+        fid = int(fact["fact_id"])
+        text[fid] = fact.get("content") or ""
+        created[fid] = fact.get("created_at") or ""
+    superseded: dict[int, int] = {}
+    for fid in text:
+        for sentence in re.split(r"(?<=[.;!?])\s+", text[fid]):
+            if not _SUPERSEDE_CUE.search(sentence):
+                continue
+            for ref in _SUPERSEDE_REF.findall(sentence):
+                rid = int(ref)
+                if rid not in text or rid == fid or rid in superseded:
+                    continue
+                newer = (created[fid] > created[rid]) if created[fid] and created[rid] else fid > rid
+                if newer:
+                    superseded[rid] = fid
+    if not superseded:
+        return ranked
+    by_id = {int(fact["fact_id"]): fact for fact in ranked}
+    seq = [int(fact["fact_id"]) for fact in ranked]
+    for stale, repl in sorted(superseded.items(), key=lambda kv: seq.index(kv[0])):
+        if stale not in seq or repl not in seq:
+            continue
+        seq.remove(repl)
+        seq.insert(seq.index(stale), repl)
+        seq.remove(stale)
+        seq.append(stale)
+    return [by_id[fid] for fid in seq]
+
+
 # Graph recall (Phase 4) is bounded, and inside search() a graph discovery never displaces a text hit: it fills the
 # result list only where the text side left room. Measured on a keyword-rich live store (807 facts), a discovery
 # scores ~0.05 against text hits of 0.17-0.42, so interleaving one into slot 4 would push a genuine hit out for
@@ -657,6 +701,7 @@ class FactRetriever:
                 ranked = text_hits + discoveries[:room]
             else:
                 ranked = text_hits
+        ranked = _demote_superseded(ranked)
         results = ranked[:limit]
         for fact in results:
             fact.pop("hrr_vector", None)  # callers expect JSON-serializable dicts
